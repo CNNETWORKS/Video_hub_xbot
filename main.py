@@ -2,17 +2,25 @@ import os
 import threading
 import random
 import json
+import logging
+import asyncio  # Fixed: Added missing import for asyncio
 from datetime import datetime, timedelta
 import pytz
 from flask import Flask
 from pyrogram import Client, filters
 from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.errors import UserNotParticipant
+from pyrogram.errors import UserNotParticipant, FloodWait
 
+# Setup logging for better debugging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Environment variables for the bot
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
+# Bot configuration
 BOT_USERNAME = "Video_hub_xbot"
 ADMIN_ID = 7271198694
 FORCE_CHANNEL = "@cnnetworkofficial"
@@ -20,6 +28,7 @@ VIDEO_CHANNEL_ID = -1003604209221
 
 TIMEZONE = pytz.timezone("Asia/Kolkata")
 
+# Limits and plans
 FREE_DAILY_LIMIT = 5
 SILVER_CREDITS, GOLD_CREDITS, PLATINUM_CREDITS = 15, 25, 40
 
@@ -29,51 +38,89 @@ PLAN_LIMITS = {
     "platinum": 10**9
 }
 
+# File paths for persistence
 DATA_FILE = "bot_data.json"
+LOG_FILE = "bot_log.txt"
 
+# Global data structures
 app = Client("video_hub", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 USERS = {}
 PREMIUM = {}
+FEEDBACK = {}  # Store user feedback
 
+# Flask web server for Render
 web = Flask(__name__)
+
 @web.route("/")
 def home():
-    return "Bot Running"
+    return "Bot Running Successfully!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 5000))
     web.run(host="0.0.0.0", port=port)
 
+# Time utilities
 def now():
     return datetime.now(TIMEZONE)
 
 def today():
     return now().date()
 
+# Data persistence functions
 def load_data():
-    global USERS, PREMIUM
+    global USERS, PREMIUM, FEEDBACK
     if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            data = json.load(f)
-            USERS = {int(k): v for k, v in data.get("users", {}).items()}
-            PREMIUM = {int(k): v for k, v in data.get("premium", {}).items()}
-            # Convert dates
-            for u in USERS.values():
-                u["last_reset"] = datetime.fromisoformat(u["last_reset"]).date() if isinstance(u["last_reset"], str) else u["last_reset"]
-                u["joined"] = datetime.fromisoformat(u["joined"]) if isinstance(u["joined"], str) else u["joined"]
-                u["seen_videos"] = set(u["seen_videos"])
-            for p in PREMIUM.values():
-                p["expiry"] = datetime.fromisoformat(p["expiry"]) if isinstance(p["expiry"], str) else p["expiry"]
+        try:
+            with open(DATA_FILE, "r") as f:
+                data = json.load(f)
+                USERS = {int(k): v for k, v in data.get("users", {}).items()}
+                PREMIUM = {int(k): v for k, v in data.get("premium", {}).items()}
+                FEEDBACK = {int(k): v for k, v in data.get("feedback", {}).items()}
+                # Convert string dates back to datetime/date objects
+                for u in USERS.values():
+                    if isinstance(u.get("last_reset"), str):
+                        u["last_reset"] = datetime.fromisoformat(u["last_reset"]).date()
+                    if isinstance(u.get("joined"), str):
+                        u["joined"] = datetime.fromisoformat(u["joined"])
+                    u["seen_videos"] = set(u.get("seen_videos", []))
+                    u["favorite_videos"] = u.get("favorite_videos", [])  # Favorites list
+                for p in PREMIUM.values():
+                    if isinstance(p.get("expiry"), str):
+                        p["expiry"] = datetime.fromisoformat(p["expiry"])
+        except Exception as e:
+            logger.error(f"Error loading data: {e}")
 
 def save_data():
-    data = {
-        "users": {k: {**v, "last_reset": v["last_reset"].isoformat(), "joined": v["joined"].isoformat(), "seen_videos": list(v["seen_videos"])} for k, v in USERS.items()},
-        "premium": {k: {**v, "expiry": v["expiry"].isoformat()} for k, v in PREMIUM.items()}
-    }
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f)
+    try:
+        data = {
+            "users": {
+                k: {
+                    **v,
+                    "last_reset": v["last_reset"].isoformat(),
+                    "joined": v["joined"].isoformat(),
+                    "seen_videos": list(v["seen_videos"]),
+                    "favorite_videos": v["favorite_videos"]
+                } for k, v in USERS.items()
+            },
+            "premium": {k: {"plan": v["plan"], "expiry": v["expiry"].isoformat()} for k, v in PREMIUM.items()},
+            "feedback": FEEDBACK
+        }
+        with open(DATA_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        logger.error(f"Error saving data: {e}")
 
+# Logging function for actions
+def log_action(action, uid=None, details=""):
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(f"{now()} - {action} - User: {uid} - {details}\n")
+        logger.info(f"{action} - User: {uid} - {details}")
+    except Exception as e:
+        logger.error(f"Logging error: {e}")
+
+# User initialization
 def load_user(uid):
     if uid not in USERS:
         USERS[uid] = {
@@ -84,11 +131,15 @@ def load_user(uid):
             "referrals": 0,
             "referred_by": None,
             "seen_videos": set(),
+            "favorite_videos": [],
             "joined": now(),
-            "notifications": True  # New: User can toggle notifications
+            "notifications": True,
+            "language": "en"
         }
         save_data()
+        log_action("New User Registered", uid)
 
+# Daily reset logic
 def reset_daily(uid):
     u = USERS[uid]
     reset_happened = u["last_reset"] != today()
@@ -97,8 +148,10 @@ def reset_daily(uid):
         u["extra_videos_today"] = 0
         u["last_reset"] = today()
         save_data()
+        log_action("Daily Reset Performed", uid)
     return reset_happened
 
+# Premium check
 def is_premium(uid):
     if uid in PREMIUM and PREMIUM[uid]["expiry"] > now():
         return PREMIUM[uid]["plan"]
@@ -106,6 +159,7 @@ def is_premium(uid):
     save_data()
     return None
 
+# Auto-upgrade based on credits
 def auto_upgrade(uid):
     u = USERS[uid]
     c = u["credits"]
@@ -128,8 +182,10 @@ def auto_upgrade(uid):
         PREMIUM[uid] = {"plan": plan, "expiry": now() + timedelta(days=7)}
     u["credits"] -= cost
     save_data()
+    log_action("Auto-Upgrade Triggered", uid, f"To {plan}")
     return plan
 
+# Limit reached message
 def limit_reached_message(uid):
     u = USERS[uid]
     link = f"https://t.me/{BOT_USERNAME}?start={uid}"
@@ -160,31 +216,44 @@ def limit_reached_message(uid):
 🤝 REFER & EARN
 ━━━━━━━━━━━━━━━━━━
 Your Referral Link:
-{link}"""
+{link}
+
+Pro Tip: Share on social media for faster referrals!"""
     return msg
 
+# Keyboard markups
 MAIN_MENU = ReplyKeyboardMarkup([
-    [KeyboardButton("🎬 Get Video")],
+    [KeyboardButton("🎬 Get Video"), KeyboardButton("❤️ Favorites")],
     [KeyboardButton("👤 Profile"), KeyboardButton("🤝 Refer & Earn")],
     [KeyboardButton("💎 Premium"), KeyboardButton("🏆 Leaderboard")],
     [KeyboardButton("🔔 Notifications"), KeyboardButton("❓ Help")],
-    [KeyboardButton("📢 About Bot")]
+    [KeyboardButton("📢 About Bot"), KeyboardButton("🗣 Feedback")],
+    [KeyboardButton("🌐 Language")]
 ], resize_keyboard=True)
 
 ADMIN_MENU = ReplyKeyboardMarkup([
     [KeyboardButton("🛠 Admin Panel")],
-    [KeyboardButton("🎬 Get Video")],
+    [KeyboardButton("🎬 Get Video"), KeyboardButton("❤️ Favorites")],
     [KeyboardButton("👤 Profile"), KeyboardButton("🤝 Refer & Earn")],
     [KeyboardButton("💎 Premium"), KeyboardButton("🏆 Leaderboard")],
     [KeyboardButton("🔔 Notifications"), KeyboardButton("❓ Help")],
-    [KeyboardButton("📢 About Bot")]
+    [KeyboardButton("📢 About Bot"), KeyboardButton("🗣 Feedback")],
+    [KeyboardButton("🌐 Language")]
 ], resize_keyboard=True)
 
 UPGRADE_BUTTONS = InlineKeyboardMarkup([
     [InlineKeyboardButton("🤝 Refer & Earn", callback_data="open_refer")],
-    [InlineKeyboardButton("💎 Premium", callback_data="open_premium")]
+    [InlineKeyboardButton("💎 Premium", callback_data="open_premium")],
+    [InlineKeyboardButton("🗣 Give Feedback", callback_data="open_feedback")]
 ])
 
+LANGUAGE_BUTTONS = InlineKeyboardMarkup([
+    [InlineKeyboardButton("English", callback_data="lang_en")],
+    [InlineKeyboardButton("Hindi", callback_data="lang_hi")],
+    [InlineKeyboardButton("Spanish", callback_data="lang_es")]
+])
+
+# Start command handler
 @app.on_message(filters.command("start"))
 async def start(_, m):
     uid = m.from_user.id
@@ -208,7 +277,7 @@ async def start(_, m):
                 [InlineKeyboardButton("🔄 Refresh", callback_data="refresh")]
             ]))
         return
-    # Joined channel
+    # Handle referral
     if ref and USERS[uid]["referred_by"] != "counted":
         load_user(ref)
         USERS[ref]["credits"] += 1
@@ -218,85 +287,90 @@ async def start(_, m):
         if upgrade_plan:
             success_msg += f"\n\n🚀 AUTO-UPGRADED TO {upgrade_plan.upper()} PREMIUM!"
         if USERS[ref]["notifications"]:
-            await app.send_message(ref, success_msg, reply_markup=MAIN_MENU if ref != ADMIN_ID else ADMIN_MENU)
+            try:
+                await app.send_message(ref, success_msg, reply_markup=MAIN_MENU if ref != ADMIN_ID else ADMIN_MENU)
+            except FloodWait as e:
+                await asyncio.sleep(e.value)  # Fixed: Use e.value for seconds
         USERS[uid]["referred_by"] = "counted"
         save_data()
-    # Elaborate welcome message
+    # Welcome message (elaborated as per design)
     username = m.from_user.first_name or "User"
-    welcome_text = f"""👋 Welcome {username} to VIDEO HUB BOT!
+    welcome_text = f"""👋 Welcome {username} to VIDEO HUB BOT – The Ultimate Video Entertainment Hub!
 
-🎬 What is VIDEO HUB?
-VIDEO HUB is your ultimate private and protected video platform on Telegram! Designed for entertainment enthusiasts, this bot delivers high-quality, exclusive videos directly to your chat. Whether you're looking for fun clips, educational content, motivational videos, or trending reels, VIDEO HUB has it all – sourced from our private channel and delivered randomly to keep things exciting and fresh every time!
+🎬 Discover VIDEO HUB:
+Dive into a world of endless entertainment with VIDEO HUB, your go-to Telegram bot for private, high-quality videos! From hilarious memes and viral clips to educational tutorials, motivational speeches, and trending content – we've got something for everyone. All videos are sourced from our exclusive private channel, delivered randomly to surprise you every time. No more boring repeats – each video is fresh for you!
 
-🚀 Uses & Features:
-- **Random Video Delivery**: Get a new, unseen video each time you request one – no repeats for the same user!
-- **Daily Limits with Flexibility**: As a free user, enjoy 5 videos per day. Premium users get more – up to unlimited!
-- **Credit System for Extra Access**: Earn credits through referrals and use them for bonus videos beyond your daily limit (1 credit = 2 extra videos).
-- **Auto-Upgrade System**: Accumulate credits to automatically unlock premium tiers without paying – perfect for active referrers!
-- **Referral Program**: Share your link, earn credits, and climb the leaderboard.
-- **Premium Plans**: Paid options for instant upgrades with higher limits.
-- **Daily Reset**: Limits refresh every day at 12:00 AM IST, so you can start fresh.
-- **Protected Content**: Videos are sent with forwarding disabled to keep them private.
-- **Notifications**: Get alerts for referrals, upgrades, resets, and more (toggleable).
-- **Leaderboard**: See top referrers and compete for the top spots.
-- **Profile Stats**: Track your videos watched, credits, referrals, and premium status.
-- **Help & About**: Quick guides and bot info at your fingertips.
-- **Admin Tools**: For the owner to manage users, broadcast updates, and view stats.
-
-━━━━━━━━━━━━━━━━━━
-✨ WHAT YOU GET AS A FREE USER
-━━━━━━━━━━━━━━━━━━
-• 🎥 5 videos every day – perfect for casual viewing!
-• ⏰ Automatic reset at 12:00 AM IST, so you never miss out on daily entertainment.
-• Access to all basic features like profile, referrals, and leaderboard.
+🚀 Why Choose VIDEO HUB? Key Uses & Features:
+- **Personalized Video Streaming**: Request random videos tailored to your viewing history (no duplicates!).
+- **Daily Video Allowance**: Free users get 5 videos/day; premium unlocks up to unlimited access.
+- **Smart Credit System**: Earn credits via referrals and redeem for extra videos or auto-upgrades.
+- **Referral Rewards Program**: Invite friends, earn credits, and climb the global leaderboard.
+- **Auto-Upgrade Magic**: Collect credits to unlock premium tiers automatically – no payment needed!
+- **Premium Subscriptions**: Paid plans for instant boosts with higher limits and exclusive perks.
+- **Daily Auto-Reset**: Fresh limits every day at 12:00 AM IST – plan your binge sessions!
+- **Content Protection**: Videos can't be forwarded, ensuring privacy and exclusivity.
+- **Custom Notifications**: Stay updated on referrals, upgrades, resets, and personalized alerts.
+- **Global Leaderboard**: Compete with users worldwide for top referrer spots and prizes.
+- **User Profile Dashboard**: Track stats, favorites, and progress in one place.
+- **Feedback Channel**: Share your thoughts to help us improve – your voice matters!
+- **Multi-Language Support**: Choose your preferred language for a better experience (English, Hindi, Spanish).
+- **Favorites List**: Save and revisit your favorite videos anytime.
+- **Advanced Admin Tools**: For seamless management by @jioxt.
 
 ━━━━━━━━━━━━━━━━━━
-💎 ABOUT PREMIUM
+✨ Free User Perks
 ━━━━━━━━━━━━━━━━━━
-Upgrade to premium for unlimited fun! Our plans are affordable and packed with value:
-• 🥈 Silver – ₹69: 30 videos/day for 7 days – ideal for moderate users.
-• 🥇 Gold – ₹149: 50 videos/day for 7 days – great for binge-watchers.
-• 👑 Platinum – ₹499: Unlimited videos for 7 days – the ultimate experience!
-Custom plans available too! Contact the owner @jioxt for payments, activations, or questions. Premium users also get priority support and early access to new features.
+• 🎥 5 High-Quality Videos Daily – Enough for quick fun or learning breaks!
+• ⏰ Reset Every Midnight IST – Come back tomorrow for more.
+• Full access to referrals, profile, leaderboard, and more.
 
 ━━━━━━━━━━━━━━━━━━
-🎁 ABOUT CREDITS & REFERRALS
+💎 Premium Power-Up
 ━━━━━━━━━━━━━━━━━━
-• Earn 1 Credit per successful referral (new user who joins the channel via your link).
-• 1 Credit = 🎥 2 Extra Videos – use them after your daily limit.
-• Credits never expire and can be used for auto-upgrades:
-  - 15 Credits → 🥈 Silver (7 days)
-  - 25 Credits → 🥇 Gold (7 days)
-  - 40 Credits → 👑 Platinum (7 days)
-• Anti-fake system: Only genuine new referrals count – no self-referrals or duplicates.
+Elevate your experience with our value-packed plans:
+• 🥈 Silver (₹69): 30 videos/day for 7 days – Perfect for casual viewers.
+• 🥇 Gold (₹149): 50 videos/day for 7 days – Ideal for enthusiasts.
+• 👑 Platinum (₹499): Unlimited videos for 7 days – For true video addicts!
+Plus: Priority content, no ads, custom video requests. Custom plans? Chat with @jioxt!
 
 ━━━━━━━━━━━━━━━━━━
-👨‍💻 Owned & Managed by @jioxt
+🎁 Credits & Referrals Explained
 ━━━━━━━━━━━━━━━━━━
-@jioxt is the creator and admin of VIDEO HUB. For any support, custom requests, premium activations, or feedback, reach out directly. We're committed to providing a safe, fun, and engaging video experience!
+• 1 Referral = 1 Credit = 2 Extra Videos.
+• Credits are eternal – use for bonuses or auto-upgrades:
+  - 15 Credits: Silver Unlock
+  - 25 Credits: Gold Unlock
+  - 40 Credits: Platinum Unlock
+• Secure system: Only real new users count – no cheats!
 
-Tap 🎬 Get Video to start watching 🍿
-Or explore the menu for more!"""
+━━━━━━━━━━━━━━━━━━
+👨‍💻 Proudly Owned by @jioxt
+━━━━━━━━━━━━━━━━━━
+@jioxt is the visionary behind VIDEO HUB, ensuring top-notch content and support. For queries, payments, custom features, or collaborations, message @jioxt directly. We're here to make your video journey amazing!
+
+Ready to dive in? Tap 🎬 Get Video now! 🍿
+Explore the menu for more options. Happy watching!"""
     markup = ADMIN_MENU if uid == ADMIN_ID else MAIN_MENU
     await m.reply(welcome_text, reply_markup=markup)
     # Check auto-upgrade for current user
     upgrade_plan = auto_upgrade(uid)
     if upgrade_plan:
-        await m.reply(f"🚀 AUTO-UPGRADED TO {upgrade_plan.upper()} PREMIUM!\nEnjoy unlimited access for 7 days.", reply_markup=markup)
+        await m.reply(f"🚀 AUTO-UPGRADED TO {upgrade_plan.upper()} PREMIUM!\nUnlock more videos and features for 7 days.", reply_markup=markup)
 
+# Callback for refresh
 @app.on_callback_query(filters.regex("refresh"))
 async def refresh_callback(_, cb):
     uid = cb.from_user.id
     try:
         await app.get_chat_member(FORCE_CHANNEL, uid)
-        # Trigger start logic
         m = type("Message", (), {"from_user": cb.from_user, "chat": {"id": cb.message.chat.id}, "command": []})
         await start(_, m)
         await cb.message.delete()
     except UserNotParticipant:
-        await cb.answer("Please join the channel first!", show_alert=True)
+        await cb.answer("Join the channel first!", show_alert=True)
 
-@app.on_callback_query(filters.regex(r"open_(refer|premium)"))
+# Callback for opening sections
+@app.on_callback_query(filters.regex(r"open_(refer|premium|feedback)"))
 async def open_section_callback(_, cb):
     uid = cb.from_user.id
     load_user(uid)
@@ -307,8 +381,20 @@ async def open_section_callback(_, cb):
         await refer(m)
     elif section == "premium":
         await premium(m)
+    elif section == "feedback":
+        await feedback(m)
     await cb.message.edit_reply_markup(None)
 
+# Language callback
+@app.on_callback_query(filters.regex(r"lang_(en|hi|es)"))
+async def set_language(_, cb):
+    uid = cb.from_user.id
+    lang = cb.matches[0].group(1)
+    USERS[uid]["language"] = lang
+    await cb.answer(f"Language set to {lang.upper()}. Note: Full support coming soon!", show_alert=True)
+    save_data()
+
+# Router for text messages
 @app.on_message(filters.text & ~filters.command(""))
 async def router(_, m):
     uid = m.from_user.id
@@ -316,19 +402,19 @@ async def router(_, m):
     reset_happened = reset_daily(uid)
     upgrade_plan = auto_upgrade(uid)
     text = m.text
-    markup = ADMIN_MENU if uid == ADMIN_ID else MAIN_MENU
-    if reset_happened:
+    markup = ADMIN_MENU if uid == ADMIN_ID else MAIN_MENU  # Fixed: Defined markup here
+    if reset_happened and USERS[uid]["notifications"]:
         reset_msg = """🌙 DAILY RESET COMPLETE!
 
-Your daily limit has been refreshed.
-Credits remain unchanged.
-Tap 🎬 Get Video to start 🍿"""
-        if USERS[uid]["notifications"]:
-            await m.reply(reset_msg, reply_markup=markup)
+Limits refreshed – enjoy fresh videos!
+Credits intact. Start with 🎬 Get Video 🍿"""
+        await m.reply(reset_msg, reply_markup=markup)
     if upgrade_plan:
-        await m.reply(f"🚀 AUTO-UPGRADED TO {upgrade_plan.upper()} PREMIUM!\nEnjoy your new benefits.", reply_markup=markup)
+        await m.reply(f"🚀 AUTO-UPGRADED TO {upgrade_plan.upper()}!\nMore videos await – happy viewing!", reply_markup=markup)
     if text == "🎬 Get Video":
         await send_video(m)
+    elif text == "❤️ Favorites":
+        await favorites(m)
     elif text == "👤 Profile":
         await profile(m)
     elif text == "🤝 Refer & Earn":
@@ -343,19 +429,25 @@ Tap 🎬 Get Video to start 🍿"""
         await help_command(m)
     elif text == "📢 About Bot":
         await about_bot(m)
+    elif text == "🗣 Feedback":
+        await feedback(m)
+    elif text == "🌐 Language":
+        await m.reply("Choose language:", reply_markup=LANGUAGE_BUTTONS)
     elif text == "🛠 Admin Panel" and uid == ADMIN_ID:
         await admin(m)
 
+# Send video handler
 async def send_video(m):
     uid = m.from_user.id
     load_user(uid)
     reset_daily(uid)
     plan = is_premium(uid)
     u = USERS[uid]
+    markup = ADMIN_MENU if uid == ADMIN_ID else MAIN_MENU  # Fixed: Defined markup
     if plan:
         daily_limit = PLAN_LIMITS[plan]
         if u["videos_today"] >= daily_limit:
-            await m.reply("🚫 Daily limit for your premium plan reached.\nReset at 12:00 AM IST.", reply_markup=MAIN_MENU if uid != ADMIN_ID else ADMIN_MENU)
+            await m.reply("🚫 Premium limit reached. Wait for reset or upgrade higher!", reply_markup=markup)
             return
         using_extra = False
     else:
@@ -368,13 +460,13 @@ async def send_video(m):
                 return
         else:
             using_extra = False
-    # Fetch videos
+    # Fetch available videos
     vids = []
-    async for msg_ in app.get_chat_history(VIDEO_CHANNEL_ID, limit=1000):  # Increased for more variety
+    async for msg_ in app.get_chat_history(VIDEO_CHANNEL_ID, limit=1000):
         if msg_.video and msg_.id not in u["seen_videos"]:
             vids.append(msg_)
     if not vids:
-        await m.reply("No new videos available right now. Our team is adding more soon! Check back later.", reply_markup=MAIN_MENU if uid != ADMIN_ID else ADMIN_MENU)
+        await m.reply("No new videos yet. Adding soon – stay tuned!", reply_markup=markup)
         return
     v = random.choice(vids)
     u["seen_videos"].add(v.id)
@@ -384,15 +476,68 @@ async def send_video(m):
             u["credits"] -= 1
             if u["credits"] < 0:
                 u["credits"] = 0
-            if USERS[uid]["notifications"]:
-                await m.reply("📉 1 Credit used for extra videos. Keep referring to earn more!")
+            if u["notifications"]:
+                await m.reply("📉 Credit used. Refer for more!", reply_markup=markup)
     else:
         u["videos_today"] += 1
     await app.copy_message(m.chat.id, VIDEO_CHANNEL_ID, v.id, protect_content=True)
     total_today = u["videos_today"] + u["extra_videos_today"]
-    await m.reply(f"🍿 Enjoy your video! This is a random pick from our exclusive collection.\n\nVideos watched today: {total_today}\nRemaining today: {daily_limit - u['videos_today'] if not using_extra else 'Using extras!'}\n\nRate it or share feedback with @jioxt!", reply_markup=MAIN_MENU if uid != ADMIN_ID else ADMIN_MENU)
+    await m.reply(f"🍿 Video delivered! Enjoy.\nToday: {total_today}\nFavorite it? Reply /favorite {v.id}", reply_markup=markup)
     save_data()
+    log_action("Video Sent", uid, str(v.id))
 
+# Favorites handler
+async def favorites(m):
+    uid = m.from_user.id
+    u = USERS[uid]
+    markup = ADMIN_MENU if uid == ADMIN_ID else MAIN_MENU  # Fixed: Defined markup
+    if not u["favorite_videos"]:
+        await m.reply("No favorites yet. Favorite videos by replying /favorite <id> after receiving one.", reply_markup=markup)
+        return
+    msg = "❤️ Your Favorites:\n"
+    for vid in u["favorite_videos"][:10]:  # Limit to 10 for brevity
+        msg += f"- Video ID: {vid}\n"
+    if len(u["favorite_videos"]) > 10:
+        msg += f"... and {len(u['favorite_videos']) - 10} more."
+    await m.reply(msg, reply_markup=markup)
+    await m.reply("Want to re-watch? Reply /rewatch <id>")
+
+# Add favorite command
+@app.on_message(filters.command("favorite"))
+async def add_favorite(_, m):
+    uid = m.from_user.id
+    if len(m.command) < 2:
+        await m.reply("Usage: /favorite <video_id>")
+        return
+    try:
+        vid = int(m.command[1])
+        if vid in USERS[uid]["seen_videos"] and vid not in USERS[uid]["favorite_videos"]:
+            USERS[uid]["favorite_videos"].append(vid)
+            await m.reply("❤️ Added to favorites!")
+            save_data()
+        else:
+            await m.reply("Invalid or already favorited.")
+    except ValueError:
+        await m.reply("Invalid video ID.")
+
+# Rewatch favorite command
+@app.on_message(filters.command("rewatch"))
+async def rewatch_favorite(_, m):
+    uid = m.from_user.id
+    if len(m.command) < 2:
+        await m.reply("Usage: /rewatch <video_id>")
+        return
+    try:
+        vid = int(m.command[1])
+        if vid in USERS[uid]["favorite_videos"]:
+            await app.copy_message(m.chat.id, VIDEO_CHANNEL_ID, vid, protect_content=True)
+            await m.reply("🍿 Re-watching favorite!")
+        else:
+            await m.reply("Not in favorites.")
+    except ValueError:
+        await m.reply("Invalid video ID.")
+
+# Profile handler
 async def profile(m):
     uid = m.from_user.id
     u = USERS[uid]
@@ -405,111 +550,306 @@ async def profile(m):
     total_today = u["videos_today"] + u["extra_videos_today"]
     joined_str = u["joined"].strftime("%d-%m-%Y")
     notif_str = "Enabled" if u["notifications"] else "Disabled"
+    lang_str = u["language"].upper()
     daily_remaining = PLAN_LIMITS.get(plan, FREE_DAILY_LIMIT) - u["videos_today"]
     extra_remaining = videos_from_credits - u["extra_videos_today"]
-    msg = f"""👤 YOUR PROFILE
+    favorites_count = len(u["favorite_videos"])
+    markup = ADMIN_MENU if uid == ADMIN_ID else MAIN_MENU  # Fixed: Defined markup
+    msg = f"""👤 PROFILE DASHBOARD
 
 ━━━━━━━━━━━━━━━━━━
-Videos Watched Today: {total_today}
-Daily Remaining: {max(0, daily_remaining)}
-Extra from Credits: {max(0, extra_remaining)}
-Credits: {u['credits']} (🎥 {videos_from_credits} extra videos total)
+Videos Today: {total_today} (Remaining: {max(0, daily_remaining)})
+Extra Remaining: {max(0, extra_remaining)}
+Credits: {u['credits']} (🎥 {videos_from_credits})
 Referrals: {u['referrals']}
-Premium Status: {prem_str}
-Joined Date: {joined_str}
+Favorites: {favorites_count}
+Premium: {prem_str}
+Joined: {joined_str}
 Notifications: {notif_str}
+Language: {lang_str}
 
 ━━━━━━━━━━━━━━━━━━
-Pro Tip: Refer more friends to earn credits and auto-upgrade!"""
-    await m.reply(msg, reply_markup=MAIN_MENU if uid != ADMIN_ID else ADMIN_MENU)
+Tip: Favorite videos to build your collection!"""
+    await m.reply(msg, reply_markup=markup)
 
+# Refer handler
 async def refer(m):
     uid = m.from_user.id
-    u = USERS[uid]
     link = f"https://t.me/{BOT_USERNAME}?start={uid}"
-    msg = f"""🤝 REFER & EARN
+    markup = ADMIN_MENU if uid == ADMIN_ID else MAIN_MENU  # Fixed: Defined markup
+    msg = f"""🤝 REFER & EARN REWARDS
 
-Earn rewards by sharing VIDEO HUB with friends!
-• 1 Successful Referral = 1 Credit
-• 1 Credit = 2 Extra Videos (use after daily limit)
+Invite friends to VIDEO HUB and reap benefits!
+• 1 Referral = 1 Credit = 2 Extra Videos
 
-How it Works:
-- Share your unique link below.
-- New users must join our channel (@cnnetworkofficial) via your link.
-- Anti-fake: No self-referrals, duplicates, or bots – only genuine new users count.
+Guide:
+- Share link.
+- New user joins channel.
+- Genuine only – no fakes.
 
-AUTO-UPGRADE TARGETS
-• 🥈 Silver – 15 Credits (30 videos/day for 7 days)
-• 🥇 Gold – 25 Credits (50 videos/day for 7 days)
-• 👑 Platinum – 40 Credits (Unlimited for 7 days)
+Upgrades:
+• 🥈 Silver: 15 Credits
+• 🥇 Gold: 25 Credits
+• 👑 Platinum: 40 Credits
 
-Your Unique Referral Link:
-{link}
+Link: {link}
 
-Start referring now and unlock premium for free! 🚀"""
-    await m.reply(msg, reply_markup=MAIN_MENU if uid != ADMIN_ID else ADMIN_MENU)
+Pro Tip: Post in groups for max referrals!"""
+    await m.reply(msg, reply_markup=markup)
 
+# Premium handler
 async def premium(m):
-    msg = """💎 PREMIUM PLANS
+    markup = ADMIN_MENU if m.from_user.id == ADMIN_ID else MAIN_MENU  # Fixed: Defined markup
+    msg = """💎 PREMIUM UNLOCKS
 
-Unlock more videos and exclusive perks with our premium subscriptions!
-• 🥈 Silver – ₹69: 30 videos/day, 7 days duration – Great starter plan!
-• 🥇 Gold – ₹149: 50 videos/day, 7 days duration – For serious viewers!
-• 👑 Platinum – ₹499: Unlimited videos, 7 days duration – No limits, pure entertainment!
+Boost your access:
+• 🥈 Silver ₹69: 30/day, 7 days
+• 🥇 Gold ₹149: 50/day, 7 days
+• 👑 Platinum ₹499: Unlimited, 7 days
 
-Benefits:
-- Higher daily limits
-- Priority video access
-- Ad-free experience (no promotions in chats)
-- Custom requests to @jioxt
+Perks: Priority, customs.
 
-Custom Plans: Need longer duration or special limits? Contact @jioxt for tailored options.
+Contact @jioxt for payment!"""
+    await m.reply(msg, reply_markup=markup)
 
-How to Upgrade:
-1. Choose your plan.
-2. Contact @jioxt for payment details (UPI, PayPal, etc.).
-3. Get activated instantly!
-
-Go premium today and elevate your video experience! 💫"""
-    await m.reply(msg, reply_markup=MAIN_MENU if m.from_user.id != ADMIN_ID else ADMIN_MENU)
-
+# Leaderboard handler
 async def leaderboard_user(m):
     ref_list = sorted(USERS.items(), key=lambda x: x[1]["referrals"], reverse=True)[:10]
-    msg = "🏆 TOP 10 REFERRERS LEADERBOARD\n\nCompete to be #1 and win special rewards from @jioxt!\n\n"
+    msg = "🏆 LEADERBOARD TOP 10\n"
     for i, (uid, u) in enumerate(ref_list, 1):
-        user = await app.get_users(uid)
-        username = user.first_name or f"User {uid}"
-        msg += f"{i}. {username}: {u['referrals']} referrals\n"
-    msg += "\nYour Position: " + str(next((i+1 for i, (k,v) in enumerate(sorted(USERS.items(), key=lambda x: x[1]["referrals"], reverse=True)) if k == m.from_user.id), "Not in top 10")) + "\n\nRefer more to climb up!"
-    await m.reply(msg, reply_markup=MAIN_MENU if m.from_user.id != ADMIN_ID else ADMIN_MENU)
+        try:
+            user = await app.get_users(uid)
+            username = user.first_name or f"User {uid}"
+            msg += f"{i}. {username}: {u['referrals']}\n"
+        except:
+            msg += f"{i}. User {uid}: {u['referrals']}\n"
+    pos = next((i+1 for i, (k,v) in enumerate(sorted(USERS.items(), key=lambda x: x[1]["referrals"], reverse=True)) if k == m.from_user.id), "N/A")
+    msg += f"\nYour Rank: {pos}"
+    markup = ADMIN_MENU if m.from_user.id == ADMIN_ID else MAIN_MENU  # Fixed: Defined markup
+    await m.reply(msg, reply_markup=markup)
 
+# Toggle notifications
 async def toggle_notifications(m):
     uid = m.from_user.id
     USERS[uid]["notifications"] = not USERS[uid]["notifications"]
     status = "enabled" if USERS[uid]["notifications"] else "disabled"
-    await m.reply(f"🔔 Notifications {status}.\nYou'll {'now' if USERS[uid]['notifications'] else 'no longer'} receive alerts for referrals, upgrades, resets, etc.", reply_markup=MAIN_MENU if uid != ADMIN_ID else ADMIN_MENU)
+    markup = ADMIN_MENU if uid == ADMIN_ID else MAIN_MENU  # Fixed: Defined markup
+    await m.reply(f"🔔 Notifications {status}.", reply_markup=markup)
     save_data()
 
+# Help handler
 async def help_command(m):
-    msg = """❓ HELP & GUIDE
+    markup = ADMIN_MENU if m.from_user.id == ADMIN_ID else MAIN_MENU  # Fixed: Defined markup
+    msg = """❓ FULL HELP GUIDE
 
-Welcome to VIDEO HUB! Here's how to use the bot:
+- 🎬 Get Video: Random video.
+- ❤️ Favorites: View/save.
+- 👤 Profile: Stats.
+- 🤝 Refer: Link.
+- 💎 Premium: Plans.
+- 🏆 Leaderboard: Ranks.
+- 🔔 Notifications: Toggle.
+- 📢 About: Info.
+- 🗣 Feedback: Share thoughts.
+- 🌐 Language: Select.
 
-- 🎬 Get Video: Request a random, exclusive video from our collection.
-- 👤 Profile: View your stats like videos watched, credits, referrals, and premium details.
-- 🤝 Refer & Earn: Get your referral link and earn credits for new users.
-- 💎 Premium: Check plans and contact @jioxt to upgrade.
-- 🏆 Leaderboard: See top referrers and your position.
-- 🔔 Notifications: Toggle alerts on/off.
-- 📢 About Bot: Learn more about VIDEO HUB.
-- Join @cnnetworkofficial for updates and community.
+Support: @jioxt"""
+    await m.reply(msg, reply_markup=markup)
 
-Tips:
-- Videos are protected – no forwarding!
-- Daily reset at 12:00 AM IST.
-- Issues? Contact @jioxt.
+# About handler
+async def about_bot(m):
+    markup = ADMIN_MENU if m.from_user.id == ADMIN_ID else MAIN_MENU  # Fixed: Defined markup
+    msg = """📢 VIDEO HUB INFO
 
-Enjoy! 🍿"""
-    await m.reply(msg, reply_markup=MAIN_MENU if m.from_user.id != ADMIN_ID else ADMIN_MENU)
+Premier video bot by @jioxt.
+Exclusive content, secure.
+Join @cnnetworkofficial.
+Feedback welcome!"""
+    await m.reply(msg, reply_markup=markup)
 
-asy
+# Feedback handler
+async def feedback(m):
+    markup = ADMIN_MENU if m.from_user.id == ADMIN_ID else MAIN_MENU  # Fixed: Defined markup
+    await m.reply("🗣 Share feedback: Reply with your message.", reply_markup=markup)
+
+# Receive feedback (reply handler)
+@app.on_message(filters.reply & filters.text)
+async def receive_feedback(_, m):
+    if "Share feedback" in m.reply_to_message.text:
+        uid = m.from_user.id
+        fb = m.text
+        FEEDBACK[uid] = fb
+        await m.reply("Thanks for feedback!")
+        try:
+            await app.send_message(ADMIN_ID, f"Feedback from {uid}: {fb}")
+        except:
+            pass
+        save_data()
+        log_action("Feedback Received", uid, fb[:50] + "..." if len(fb) > 50 else fb)
+
+# Admin panel
+async def admin(m):
+    markup = ADMIN_MENU  # Fixed: Defined markup
+    msg = """🛠 ADMIN COMMANDS
+
+/addpremium <uid> <plan> <days>
+/removepremium <uid>
+/addcredits <uid> <credits>
+/broadcast <msg>
+/stats
+/leaderboard
+/userinfo <uid>
+/viewfeedback
+/viewlogs"""
+    await m.reply(msg, reply_markup=markup)
+
+# Admin commands
+@app.on_message(filters.command("addpremium") & filters.user(ADMIN_ID))
+async def addprem(_, m):
+    try:
+        parts = m.text.split()
+        uid = int(parts[1])
+        plan = parts[2].lower()
+        days = int(parts[3])
+        if plan not in PLAN_LIMITS:
+            await m.reply("Invalid plan.")
+            return
+        if uid in PREMIUM:
+            PREMIUM[uid]["expiry"] += timedelta(days=days)
+            if PREMIUM[uid]["plan"] != plan:
+                PREMIUM[uid]["plan"] = plan
+        else:
+            PREMIUM[uid] = {"plan": plan, "expiry": now() + timedelta(days=days)}
+        load_user(uid)
+        await m.reply(f"Premium added: {plan} {days} days to {uid}")
+        if USERS[uid]["notifications"]:
+            await app.send_message(uid, f"🎉 Premium {plan.upper()} for {days} days!")
+        save_data()
+        log_action("Add Premium", uid, f"{plan} {days}")
+    except:
+        await m.reply("Usage: /addpremium <uid> <plan> <days>")
+
+@app.on_message(filters.command("removepremium") & filters.user(ADMIN_ID))
+async def removeprem(_, m):
+    try:
+        uid = int(m.text.split()[1])
+        PREMIUM.pop(uid, None)
+        await m.reply(f"Premium removed {uid}")
+        if uid in USERS and USERS[uid]["notifications"]:
+            await app.send_message(uid, "Premium removed.")
+        save_data()
+        log_action("Remove Premium", uid)
+    except:
+        await m.reply("Usage: /removepremium <uid>")
+
+@app.on_message(filters.command("addcredits") & filters.user(ADMIN_ID))
+async def addcredits(_, m):
+    try:
+        parts = m.text.split()
+        uid = int(parts[1])
+        credits = int(parts[2])
+        load_user(uid)
+        USERS[uid]["credits"] += credits
+        await m.reply(f"Added {credits} to {uid}")
+        if USERS[uid]["notifications"]:
+            await app.send_message(uid, f"+{credits} Credits!")
+        auto_upgrade(uid)
+        save_data()
+        log_action("Add Credits", uid, credits)
+    except:
+        await m.reply("Usage: /addcredits <uid> <credits>")
+
+@app.on_message(filters.command("broadcast") & filters.user(ADMIN_ID))
+async def bc(_, m):
+    msg = m.text.replace("/broadcast", "").strip()
+    if not msg:
+        await m.reply("Usage: /broadcast <msg>")
+        return
+    sent = 0
+    for uid in list(USERS.keys()):
+        try:
+            markup = MAIN_MENU if uid != ADMIN_ID else ADMIN_MENU
+            await app.send_message(uid, msg, reply_markup=markup)
+            sent += 1
+        except:
+            pass
+    await m.reply(f"Sent to {sent} users")
+    log_action("Broadcast", details=msg[:50] + "..." if len(msg) > 50 else msg)
+
+@app.on_message(filters.command("stats") & filters.user(ADMIN_ID))
+async def stats(_, m):
+    user_count = len(USERS)
+    prem_count = sum(1 for uid in USERS if is_premium(uid))
+    total_videos = sum(u["videos_today"] + u["extra_videos_today"] for u in USERS.values())
+    total_credits = sum(u["credits"] for u in USERS.values())
+    total_referrals = sum(u["referrals"] for u in USERS.values())
+    total_favorites = sum(len(u["favorite_videos"]) for u in USERS.values())
+    msg = f"📊 STATS\nUsers: {user_count}\nPremium: {prem_count}\nVideos Today: {total_videos}\nCredits: {total_credits}\nReferrals: {total_referrals}\nFavorites: {total_favorites}"
+    await m.reply(msg)
+
+@app.on_message(filters.command("leaderboard") & filters.user(ADMIN_ID))
+async def leaderboard(_, m):
+    ref_list = sorted(USERS.items(), key=lambda x: x[1]["referrals"], reverse=True)[:10]
+    msg = "🏆 ADMIN LEADERBOARD\n"
+    for i, (uid, u) in enumerate(ref_list, 1):
+        try:
+            user = await app.get_users(uid)
+            username = user.first_name or f"User {uid}"
+            msg += f"{i}. {username} ({uid}): {u['referrals']}\n"
+        except:
+            msg += f"{i}. User {uid}: {u['referrals']}\n"
+    await m.reply(msg)
+
+@app.on_message(filters.command("userinfo") & filters.user(ADMIN_ID))
+async def userinfo(_, m):
+    try:
+        uid = int(m.text.split()[1])
+        if uid not in USERS:
+            await m.reply("User not found.")
+            return
+        u = USERS[uid]
+        plan = is_premium(uid)
+        prem_str = plan.upper() if plan else "No"
+        if plan:
+            expiry = PREMIUM[uid]["expiry"].strftime("%d-%m-%Y %H:%M")
+            prem_str += f" ({expiry})"
+        videos_from_credits = u["credits"] * 2
+        total_today = u["videos_today"] + u["extra_videos_today"]
+        joined_str = u["joined"].strftime("%d-%m-%Y")
+        notif_str = "Enabled" if u["notifications"] else "Disabled"
+        lang_str = u["language"].upper()
+        favorites = len(u["favorite_videos"])
+        try:
+            user = await app.get_users(uid)
+            username = user.first_name or "Unknown"
+        except:
+            username = "Unknown"
+        msg = f"👤 {uid} ({username})\nVideos Today: {total_today}\nCredits: {u['credits']} ({videos_from_credits})\nReferrals: {u['referrals']}\nFavorites: {favorites}\nPremium: {prem_str}\nJoined: {joined_str}\nNotifications: {notif_str}\nLanguage: {lang_str}\nSeen: {len(u['seen_videos'])}"
+        await m.reply(msg)
+    except:
+        await m.reply("Usage: /userinfo <uid>")
+
+@app.on_message(filters.command("viewfeedback") & filters.user(ADMIN_ID))
+async def view_feedback(_, m):
+    if not FEEDBACK:
+        await m.reply("No feedback yet.")
+        return
+    msg = "🗣 FEEDBACKS\n"
+    for uid, fb in list(FEEDBACK.items())[-10:]:  # Last 10
+        msg += f"User {uid}: {fb}\n"
+    await m.reply(msg)
+
+@app.on_message(filters.command("viewlogs") & filters.user(ADMIN_ID))
+async def view_logs(_, m):
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE, "r") as f:
+            logs = f.read()[-2000:]  # Last 2000 chars
+        await m.reply(f"Recent Logs:\n{logs}")
+    else:
+        await m.reply("No logs.")
+
+# Main execution
+if __name__ == "__main__":
+    load_data()
+    threading.Thread(target=run_flask, daemon=True).start()
+    app.run()
