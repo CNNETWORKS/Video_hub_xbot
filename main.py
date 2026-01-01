@@ -2,33 +2,53 @@ import os
 import threading
 import random
 from datetime import datetime, timedelta
+import pytz
+
 from flask import Flask
-
 from pyrogram import Client, filters
-from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton
+from pyrogram.types import (
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton
+)
 
-# ================== CONFIG ==================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# ================= CONFIG =================
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
+BOT_USERNAME = "Video_hub_xbot"
 ADMIN_ID = 7271198694
+
+FORCE_CHANNEL = "@cnnetworkofficial"
 VIDEO_CHANNEL_ID = -1003604209221
+
+TIMEZONE = pytz.timezone("Asia/Kolkata")
 
 FREE_DAILY_LIMIT = 5
 
-# ================== FLASK (RENDER NEEDS THIS) ==================
+SILVER_CREDITS = 15
+GOLD_CREDITS = 25
+PLATINUM_CREDITS = 40
+
+PLAN_LIMITS = {
+    "silver": 30,
+    "gold": 50,
+    "platinum": 10**9
+}
+
+# ================= FLASK =================
 web = Flask(__name__)
 
 @web.route("/")
 def home():
-    return "✅ Video Hub Bot is running"
+    return "Video Hub Bot Running"
 
 def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    web.run(host="0.0.0.0", port=port)
+    web.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
 
-# ================== PYROGRAM BOT ==================
+# ================= PYROGRAM =================
 app = Client(
     "video_hub",
     api_id=API_ID,
@@ -36,33 +56,66 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
-# ================== STORAGE ==================
+# ================= DATABASE =================
 USERS = {}
 PREMIUM = {}
 
-# ================== HELPERS ==================
 def now():
-    return datetime.now()
+    return datetime.now(TIMEZONE)
+
+def today():
+    return now().date()
 
 def init_user(uid):
     if uid not in USERS:
         USERS[uid] = {
-            "videos": 0,
-            "reset": now(),
-            "joined": now(),
-            "referrals": 0
+            "videos_today": 0,
+            "last_reset": today(),
+            "credits": 0,
+            "referrals": 0,
+            "referred_by": None,
+            "seen_videos": set(),
+            "joined": now()
         }
 
-def reset_limit(uid):
-    if (now() - USERS[uid]["reset"]).days >= 1:
-        USERS[uid]["videos"] = 0
-        USERS[uid]["reset"] = now()
+def reset_daily(uid):
+    if USERS[uid]["last_reset"] != today():
+        USERS[uid]["videos_today"] = 0
+        USERS[uid]["last_reset"] = today()
 
 def is_premium(uid):
-    return uid in PREMIUM and PREMIUM[uid] > now()
+    if uid in PREMIUM:
+        if PREMIUM[uid]["expiry"] > now():
+            return True
+        del PREMIUM[uid]
+    return False
 
-# ================== KEYBOARDS ==================
-MAIN_KB = ReplyKeyboardMarkup(
+def current_plan(uid):
+    return PREMIUM[uid]["plan"] if is_premium(uid) else None
+
+# ================= AUTO UPGRADE =================
+def check_auto_upgrade(uid):
+    credits = USERS[uid]["credits"]
+
+    if credits >= PLATINUM_CREDITS:
+        PREMIUM[uid] = {"plan": "platinum", "expiry": now() + timedelta(days=7)}
+        USERS[uid]["credits"] -= PLATINUM_CREDITS
+        return "platinum"
+
+    if credits >= GOLD_CREDITS:
+        PREMIUM[uid] = {"plan": "gold", "expiry": now() + timedelta(days=7)}
+        USERS[uid]["credits"] -= GOLD_CREDITS
+        return "gold"
+
+    if credits >= SILVER_CREDITS:
+        PREMIUM[uid] = {"plan": "silver", "expiry": now() + timedelta(days=7)}
+        USERS[uid]["credits"] -= SILVER_CREDITS
+        return "silver"
+
+    return None
+
+# ================= MENUS =================
+MAIN_MENU = ReplyKeyboardMarkup(
     [
         [KeyboardButton("🎬 Get Video")],
         [KeyboardButton("👤 Profile"), KeyboardButton("🤝 Refer & Earn")],
@@ -71,7 +124,7 @@ MAIN_KB = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-ADMIN_KB = ReplyKeyboardMarkup(
+ADMIN_MENU = ReplyKeyboardMarkup(
     [
         [KeyboardButton("🛠 Admin Panel")],
         [KeyboardButton("🎬 Get Video")],
@@ -81,131 +134,199 @@ ADMIN_KB = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# ================== START ==================
+def upgrade_buttons():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🤝 Refer & Earn", callback_data="open_refer")],
+        [InlineKeyboardButton("💎 Premium", callback_data="open_premium")]
+    ])
+
+# ================= START =================
 @app.on_message(filters.command("start"))
 async def start(_, m):
     uid = m.from_user.id
     init_user(uid)
 
-    kb = ADMIN_KB if uid == ADMIN_ID else MAIN_KB
+    if len(m.command) > 1 and USERS[uid]["referred_by"] is None:
+        ref = int(m.command[1])
+        if ref != uid:
+            USERS[uid]["referred_by"] = ref
 
+    try:
+        await app.get_chat_member(FORCE_CHANNEL, uid)
+    except:
+        await m.reply(
+            "🔒 Join channel to continue",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📢 Join Channel", url="https://t.me/cnnetworkofficial")],
+                [InlineKeyboardButton("🔄 Refresh", callback_data="refresh")]
+            ])
+        )
+        return
+
+    referrer = USERS[uid]["referred_by"]
+    if referrer and referrer in USERS and referrer != "counted":
+        USERS[referrer]["referrals"] += 1
+        USERS[referrer]["credits"] += 1
+        USERS[uid]["referred_by"] = "counted"
+
+        plan = check_auto_upgrade(referrer)
+
+        msg = (
+            "🎉 REFERRAL SUCCESS!\n\n"
+            "You earned 🎁 1 Credit = 🎥 2 Videos\n\n"
+            f"Total Credits: {USERS[referrer]['credits']}"
+        )
+        if plan:
+            msg += f"\n\n🚀 AUTO-UPGRADED TO {plan.upper()}!"
+
+        await app.send_message(referrer, msg)
+
+    menu = ADMIN_MENU if uid == ADMIN_ID else MAIN_MENU
     await m.reply(
-        f"👋 Welcome **{m.from_user.first_name}**\n\n"
-        "🎬 Get random videos\n"
-        "🤝 Refer & earn\n"
-        "💎 Upgrade for unlimited access",
-        reply_markup=kb
+        "👋 Welcome to VIDEO HUB\n\n"
+        "• Free: 5 videos/day\n"
+        "• 1 Credit = 2 Videos\n"
+        "• Refer friends to auto-unlock Premium",
+        reply_markup=menu
     )
 
-# ================== ROUTER (FIXED) ==================
+@app.on_callback_query(filters.regex("refresh"))
+async def refresh(_, q):
+    await start(_, q.message)
+
+# ================= ROUTER =================
 @app.on_message(filters.text & ~filters.regex("^/"))
 async def router(_, m):
     uid = m.from_user.id
     init_user(uid)
-    reset_limit(uid)
+    reset_daily(uid)
 
-    text = m.text.strip()
-
-    if text == "🎬 Get Video":
+    if m.text == "🎬 Get Video":
         await send_video(m)
-
-    elif text == "👤 Profile":
+    elif m.text == "👤 Profile":
         await profile(m)
-
-    elif text == "🤝 Refer & Earn":
+    elif m.text == "🤝 Refer & Earn":
         await refer(m)
-
-    elif text == "💎 Premium":
+    elif m.text == "💎 Premium":
         await premium(m)
-
-    elif text == "🛠 Admin Panel" and uid == ADMIN_ID:
+    elif m.text == "🛠 Admin Panel" and uid == ADMIN_ID:
         await admin_panel(m)
 
-# ================== VIDEO ==================
+# ================= VIDEO =================
 async def send_video(m):
-    uid = m.from_user.id
-
-    if not is_premium(uid):
-        if USERS[uid]["videos"] >= FREE_DAILY_LIMIT:
-            await m.reply(
-                "🚫 **Limit Reached**\n\n"
-                "Free users: 5/day\n"
-                "Upgrade to Premium 💎"
-            )
-            return
-
-    USERS[uid]["videos"] += 1
-
-    await app.copy_message(
-        chat_id=m.chat.id,
-        from_chat_id=VIDEO_CHANNEL_ID,
-        message_id=random.randint(1, 50)
-    )
-
-# ================== PROFILE ==================
-async def profile(m):
     uid = m.from_user.id
     user = USERS[uid]
 
-    await m.reply(
-        f"👤 **Your Profile**\n\n"
-        f"🆔 ID: `{uid}`\n"
-        f"🎬 Videos today: {user['videos']}\n"
-        f"🤝 Referrals: {user['referrals']}\n"
-        f"💎 Premium: {'Yes' if is_premium(uid) else 'No'}\n"
-        f"📅 Joined: {user['joined'].strftime('%d-%m-%Y')}"
+    if is_premium(uid):
+        limit = PLAN_LIMITS[current_plan(uid)]
+        if user["videos_today"] >= limit:
+            await m.reply("🚫 Premium daily limit reached")
+            return
+    else:
+        if user["videos_today"] >= FREE_DAILY_LIMIT:
+            await m.reply(
+                f"🚫 DAILY LIMIT REACHED\n\n"
+                f"Referral Link:\nhttps://t.me/{BOT_USERNAME}?start={uid}",
+                reply_markup=upgrade_buttons()
+            )
+            return
+
+    videos = []
+    async for msg in app.get_chat_history(VIDEO_CHANNEL_ID, limit=200):
+        if msg.video and msg.id not in user["seen_videos"]:
+            videos.append(msg)
+
+    if not videos:
+        await m.reply("⚠️ No new videos available.")
+        return
+
+    v = random.choice(videos)
+    user["seen_videos"].add(v.id)
+
+    await app.copy_message(
+        m.chat.id,
+        VIDEO_CHANNEL_ID,
+        v.id,
+        protect_content=True
     )
 
-# ================== REFER ==================
+    user["videos_today"] += 1
+
+# ================= PROFILE =================
+async def profile(m):
+    u = USERS[m.from_user.id]
+    await m.reply(
+        f"👤 PROFILE\n\n"
+        f"Credits: {u['credits']} (🎥 {u['credits']*2})\n"
+        f"Referrals: {u['referrals']}\n"
+        f"Premium: {'Yes' if is_premium(m.from_user.id) else 'No'}"
+    )
+
+# ================= REFER =================
 async def refer(m):
     uid = m.from_user.id
-    me = await app.get_me()
     await m.reply(
-        f"🤝 **Refer & Earn**\n\n"
-        f"Invite friends:\n"
-        f"https://t.me/{me.username}?start={uid}"
+        f"🤝 REFER & EARN\n\n"
+        f"1 Referral = 1 Credit = 2 Videos\n\n"
+        f"Auto-upgrade:\n"
+        f"Silver: {SILVER_CREDITS}\n"
+        f"Gold: {GOLD_CREDITS}\n"
+        f"Platinum: {PLATINUM_CREDITS}\n\n"
+        f"Your Link:\nhttps://t.me/{BOT_USERNAME}?start={uid}"
     )
 
-# ================== PREMIUM ==================
+# ================= PREMIUM =================
 async def premium(m):
     await m.reply(
-        "💎 **Premium Plans**\n\n"
-        "🥈 Silver – ₹69 (30/day)\n"
-        "🥇 Gold – ₹149 (50/day)\n"
-        "👑 Platinum – ₹499 (Unlimited)\n\n"
-        "📩 Contact: @jioxt"
+        "💎 PREMIUM PLANS\n\n"
+        "Silver ₹69 (30/day)\n"
+        "Gold ₹149 (50/day)\n"
+        "Platinum ₹499 (Unlimited)\n\n"
+        "Contact @jioxt"
     )
 
-# ================== ADMIN ==================
+@app.on_callback_query(filters.regex("open_premium"))
+async def cb_premium(_, q):
+    await premium(q.message)
+
+@app.on_callback_query(filters.regex("open_refer"))
+async def cb_refer(_, q):
+    await refer(q.message)
+
+# ================= ADMIN =================
 async def admin_panel(m):
     await m.reply(
-        "🛠 **Admin Panel**\n\n"
-        "/addpremium user_id days\n"
-        "/removepremium user_id\n"
+        "/addpremium user_id plan days\n"
+        "/broadcast message\n"
         "/stats"
     )
 
 @app.on_message(filters.command("addpremium") & filters.user(ADMIN_ID))
 async def add_premium(_, m):
-    _, uid, days = m.text.split()
-    PREMIUM[int(uid)] = now() + timedelta(days=int(days))
+    _, uid, plan, days = m.text.split()
+    PREMIUM[int(uid)] = {
+        "plan": plan.lower(),
+        "expiry": now() + timedelta(days=int(days))
+    }
     await m.reply("✅ Premium added")
 
-@app.on_message(filters.command("removepremium") & filters.user(ADMIN_ID))
-async def remove_premium(_, m):
-    _, uid = m.text.split()
-    PREMIUM.pop(int(uid), None)
-    await m.reply("❌ Premium removed")
+@app.on_message(filters.command("broadcast") & filters.user(ADMIN_ID))
+async def broadcast(_, m):
+    msg = m.text.replace("/broadcast", "").strip()
+    for uid in USERS:
+        try:
+            await app.send_message(uid, msg)
+        except:
+            pass
+    await m.reply("📢 Broadcast sent")
 
 @app.on_message(filters.command("stats") & filters.user(ADMIN_ID))
 async def stats(_, m):
     await m.reply(
-        f"📊 **Stats**\n\n"
-        f"Users: {len(USERS)}\n"
-        f"Premium: {len(PREMIUM)}"
+        f"Users: {len(USERS)}\nPremium: {len(PREMIUM)}"
     )
 
-# ================== RUN BOTH ==================
+# ================= RUN =================
 if __name__ == "__main__":
     threading.Thread(target=run_flask).start()
     app.run()
